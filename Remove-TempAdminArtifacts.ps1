@@ -1,8 +1,6 @@
 <#
-.SYNOPSIS
 Removes a temporary administrator account and its common registry remnants.
 
-.DESCRIPTION
 Use this script after Rename-UserProfile.ps1 has completed and the renamed
 account can sign in normally. The script removes the TempAdmin local account,
 its Win32_UserProfile entry, leftover profile registry keys, Group Policy
@@ -16,23 +14,64 @@ param(
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$Mutex = $null
 
-if ([string]::IsNullOrWhiteSpace($BackupRoot)) {
-    $BackupRoot = Join-Path (Split-Path -Parent $PSCommandPath) 'ProfileBackup'
+function Terminate {
+    param(
+        [string]$Message = '',
+        [int]$Exitcode = 0
+    )
+
+    if ($Message) {
+        Write-Host $Message -f Red
+    }
+
+    pause
+    
+    if ($script:Mutex) {
+        $script:Mutex.Close()
+    }
+    exit $ExitCode
 }
-
-$TempProfilePath = "C:\Users\$TempAdmin"
-$BackupDir = Join-Path $BackupRoot 'TempAdminCleanup'
 
 function Test-IsAdministrator {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Ensure-Directory {
+
+try {  # Pause on error
+
+
+if (-not (Test-IsAdministrator)) {
+    Terminate 'This cleanup script requires Administrator privileges.' -Exitcode 1
+}
+
+if ($env:UserName -ieq $TempAdmin) {
+    Terminate "You cannot delete the data of the temporary account $TempAdmin from which you are logged in!" -Exitcode 1
+}
+
+
+# Ensure only one script instance
+$MutexName = 'CleanupTempAdmin'
+$IsMutexCreated = $false
+
+$Mutex = New-Object Threading.Mutex($false, $MutexName, [ref]$IsMutexCreated)
+
+if (-not $IsMutexCreated) {
+    Terminate 'Another instance of the script is already running!' -ExitCode 1
+}
+
+
+$BackupRoot = Join-Path (Split-Path -Parent $PSCommandPath) 'ProfileBackup'
+$TempProfilePath = "C:\Users\$TempAdmin"
+$BackupDir = Join-Path $BackupRoot 'TempAdminCleanup'
+
+# ── Helpers ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+function Create-Directory {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
+    if (-not (Test-Path -Literal $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
 }
@@ -55,7 +94,7 @@ function Get-TempAdminSids {
     )
 
     foreach ($profileKey in $profileKeys) {
-        if (-not (Test-Path -LiteralPath $profileKey)) {
+        if (-not (Test-Path -Literal $profileKey)) {
             continue
         }
 
@@ -77,7 +116,7 @@ function Get-TempAdminSids {
     }
 
     $gpRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\DataStore'
-    if (Test-Path -LiteralPath $gpRoot) {
+    if (Test-Path -Literal $gpRoot) {
         foreach ($child in Get-ChildItem -Path $gpRoot -ErrorAction SilentlyContinue) {
             try {
                 $values = (Get-ItemProperty -Path $child.PSPath).PSObject.Properties.Value
@@ -115,7 +154,7 @@ function Grant-RegistryKeyFullControl {
 function Remove-RegistryKeyRobust {
     param([string]$RegistryPath)
 
-    if (-not (Test-Path -LiteralPath $RegistryPath)) {
+    if (-not (Test-Path -Literal $RegistryPath)) {
         return
     }
 
@@ -138,7 +177,7 @@ function Find-WindowsSearchTempAdminKeys {
     $namePattern = [regex]::Escape($TempAdmin)
 
     foreach ($root in $roots) {
-        if (-not (Test-Path -LiteralPath $root)) {
+        if (-not (Test-Path -Literal $root)) {
             continue
         }
 
@@ -163,17 +202,9 @@ function Find-WindowsSearchTempAdminKeys {
     return $matches | Sort-Object -Unique
 }
 
-if (-not (Test-IsAdministrator)) {
-    Write-Host 'This cleanup script requires Administrator privileges.' -ForegroundColor Red
-    exit 1
-}
+# ── Cleanup ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-if ($env:USERNAME -ieq $TempAdmin) {
-    Write-Host "Do not run cleanup while logged in as $TempAdmin." -ForegroundColor Red
-    exit 1
-}
-
-Ensure-Directory -Path $BackupDir
+Create-Directory -Path $BackupDir
 
 Invoke-RegExport -Key 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Destination (Join-Path $BackupDir 'ProfileList_64.reg')
 Invoke-RegExport -Key 'HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\ProfileList' -Destination (Join-Path $BackupDir 'ProfileList_32.reg')
@@ -197,7 +228,7 @@ foreach ($profile in $tempProfiles) {
     Write-Host "Removed Win32_UserProfile $($profile.SID)" -ForegroundColor Green
 }
 
-if (Test-Path -LiteralPath $TempProfilePath) {
+if (Test-Path -Literal $TempProfilePath) {
     Remove-Item -Path $TempProfilePath -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "Removed folder $TempProfilePath" -ForegroundColor Green
 }
@@ -213,6 +244,16 @@ $searchKeys = Find-WindowsSearchTempAdminKeys
 foreach ($searchKey in $searchKeys) {
     Remove-RegistryKeyRobust -RegistryPath $searchKey
     Write-Host "Removed Windows Search key $searchKey" -ForegroundColor Green
+}
+
+
+} catch {
+    Write-Output $_
+    Terminate -ExitCode 1
+} finally {
+    if ($Mutex) {
+        $Mutex.Close()
+    }
 }
 
 Write-Host ''
